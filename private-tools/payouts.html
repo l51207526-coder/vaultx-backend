@@ -1,0 +1,119 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>VaultX payout approvals</title>
+<style>
+:root{color-scheme:dark;--bg:#07111f;--card:#0b1929;--line:#20364d;--muted:#9fb0c4;--green:#31c99a;--red:#ff6b75}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:#f4f7fb;font:15px system-ui,Segoe UI,sans-serif}.page{max-width:1000px;margin:0 auto;padding:28px 20px 60px}h1{margin:0 0 8px}.muted{color:var(--muted);line-height:1.5}.panel,.withdrawal{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:18px;margin:16px 0}.toolbar,.row{display:flex;align-items:center;justify-content:space-between;gap:14px;flex-wrap:wrap}.button{border:0;border-radius:9px;padding:11px 15px;background:var(--green);color:#041610;font-weight:700;cursor:pointer}.button.secondary{background:#142a40;color:#edf4fc;border:1px solid var(--line)}.button:disabled{opacity:.5;cursor:not-allowed}.amount{font-size:20px;font-weight:800}.error{color:var(--red)}.success{color:var(--green)}.small{font-size:13px}.actions{margin-top:14px}.notice{border-left:3px solid #f0b54c;padding:10px 12px;background:#211d13;color:#f5dfa8;border-radius:5px;margin-top:14px}.mono{font:13px ui-monospace,Consolas,monospace;overflow-wrap:anywhere}.withdrawal+.withdrawal{margin-top:12px}
+</style>
+</head>
+<body>
+<main class="page">
+  <p><a href="/" class="muted">← Back to VaultX</a></p>
+  <h1>Withdrawal approvals</h1>
+  <p class="muted">Connect the Trust Wallet browser extension that holds the payout funds. Review every address and amount in Trust Wallet before approving. VaultX records the transaction and updates the ledger after the BNB Smart Chain transfer confirms.</p>
+  <section class="panel">
+    <div class="toolbar"><div><strong id="walletStatus">Trust Wallet is not connected</strong><div id="walletAddress" class="muted mono"></div></div><button id="connectButton" class="button" type="button" onclick="connectTrustWallet()">Connect Trust Wallet</button></div>
+    <p id="pageStatus" class="muted" role="status" aria-live="polite">Loading payout requests…</p>
+    <div id="queue"></div>
+    <div class="notice">Trust Wallet will ask for approval for each payout. This page never asks for your recovery phrase or private key. The connected wallet needs BNB for network fees. This automated send flow currently supports BEP20 only; TRC20 requests remain on the existing manual process.</div>
+  </section>
+</main>
+<script>
+const apiBase = `${(window.VAULTX_API_BASE || (location.hostname === "localhost" || location.hostname === "127.0.0.1" ? "http://localhost:4000" : `${location.protocol}//${location.hostname}:4000`)).replace(/\/+$/, "")}/api`;
+const providerMap = new Map();
+let trustProvider = null;
+let connectedAccount = "";
+let connectionPending = false;
+let queueItems = [];
+let config = {};
+window.addEventListener("eip6963:announceProvider", (event) => {
+  const detail = event.detail;
+  if (detail?.info?.rdns === "com.trustwallet.app") trustProvider = detail.provider;
+});
+window.dispatchEvent(new Event("eip6963:requestProvider"));
+
+function authToken(){return localStorage.getItem("vaultx_token")||""}
+async function api(path,options={}){
+  const response=await fetch(`${apiBase}${path}`,{...options,headers:{"content-type":"application/json",...(authToken()?{authorization:`Bearer ${authToken()}`}:{}) ,...(options.headers||{})}});
+  const body=await response.json().catch(()=>({}));
+  if(!response.ok)throw new Error(body.error||`Request failed (${response.status})`);
+  return body;
+}
+function setStatus(text,kind="muted"){const el=document.getElementById("pageStatus");el.textContent=text;el.className=kind}
+function formatAmount(value){return `${Number(value).toLocaleString(undefined,{minimumFractionDigits:2,maximumFractionDigits:8})} USDT`}
+function decimalUnits(value,decimals){const [whole,fraction=""]=String(value).split(".");if(!/^\d+$/.test(whole)||!/^\d*$/.test(fraction)||fraction.length>decimals)throw new Error("The payout amount has unsupported precision");return (BigInt(whole)*10n**BigInt(decimals)+BigInt((fraction+"0".repeat(decimals)).slice(0,decimals))).toString(16)}
+function transferData(to,amount){if(!/^0x[0-9a-fA-F]{40}$/.test(to))throw new Error("The destination address is invalid");const recipient=to.slice(2).toLowerCase().padStart(64,"0");const units=decimalUnits(amount,18).padStart(64,"0");return `0xa9059cbb${recipient}${units}`}
+async function connectTrustWallet(){
+  if(connectionPending)return;
+  if(!trustProvider){window.dispatchEvent(new Event("eip6963:requestProvider"));await new Promise(resolve=>setTimeout(resolve,150));}
+  if(!trustProvider){setStatus("Trust Wallet browser extension was not detected. Open this page in the browser where Trust Wallet is installed.","error");return}
+  connectionPending=true;
+  const button=document.getElementById("connectButton");
+  button.disabled=true;button.textContent="Connecting…";
+  try{
+    let accounts=await trustProvider.request({method:"eth_accounts"});
+    if(!accounts?.length)accounts=await trustProvider.request({method:"eth_requestAccounts"});
+    connectedAccount=accounts?.[0]||"";
+    if(!connectedAccount)throw new Error("Trust Wallet did not provide an account");
+    document.getElementById("walletStatus").textContent="Trust Wallet connected";
+    document.getElementById("walletAddress").textContent=connectedAccount;
+    document.getElementById("walletStatus").className="success";
+    renderQueue();
+    setStatus("Connected. Confirm the correct sending account before approving any request.");
+  }
+  catch(error){
+    const message=error instanceof Error?error.message:"Wallet connection was cancelled.";
+    setStatus(message.includes("INTERNAL_UnlockPopup")?"Trust Wallet already has an unlock request open. Finish or dismiss it in the extension, then try Connect once more.":message,"error");
+  }
+  finally{connectionPending=false;button.disabled=false;button.textContent="Connect Trust Wallet"}
+}
+async function loadQueue(){
+  if(!authToken()){setStatus("Sign in to VaultX first, then reload this page.","error");return}
+  try{const data=await api("/payouts/pending");queueItems=data.withdrawals||[];config=data;renderQueue();if(data.configurationError)setStatus(data.configurationError,"error");else setStatus(`${queueItems.length} pending withdrawal request${queueItems.length===1?"":"s"}.`);}
+  catch(error){setStatus(error.message,"error")}
+}
+function renderQueue(){
+  const root=document.getElementById("queue");
+  if(!queueItems.length){root.innerHTML='<p class="muted">No pending withdrawals.</p>';return}
+  root.innerHTML=queueItems.map(item=>{
+    const savedHash=item.payoutTxHash?item.payoutTxHash.split(":").slice(1).join(":"):"";
+    const supported=item.network==="BEP20";
+    const walletMatches=!!connectedAccount&&!!config.senderAddress&&connectedAccount.toLowerCase()===config.senderAddress.toLowerCase();
+    const canSend=supported&&!item.payoutTxHash&&walletMatches&&!!config.tokenContract;
+    const canCheck=supported&&!!item.payoutTxHash;
+    const action=canCheck?`<button class="button secondary" onclick="checkPayout('${item.id}','${savedHash}')">Check confirmation</button>`:`<button class="button" ${canSend?"":"disabled"} onclick="sendPayout('${item.id}')">Send with Trust Wallet</button>`;
+    const note=!supported?"Automated sending is currently available for BEP20 only; process this TRC20 request using the existing admin flow.":item.payoutTxHash?`Transaction submitted: <span class="mono">${savedHash}</span> · VaultX will not send it twice.`:!config.senderAddress?"Set BSC_SEND_ADDRESS in the backend configuration.":!connectedAccount?"Connect Trust Wallet to enable sending.":!walletMatches?"Connected account does not match the configured BSC_SEND_ADDRESS.":"Check the destination, net amount, and Trust Wallet prompt before approving.";
+    return `<article class="withdrawal"><div class="row"><div><strong>${item.reference||"Withdrawal"}</strong><div class="muted small">${new Date(item.createdAt).toLocaleString()} · ${item.network}</div></div><div class="amount">${formatAmount(item.netAmount)}</div></div><p class="small">Requested: ${formatAmount(item.amount)} · Fee: ${formatAmount(item.feeAmount)}</p><p class="small">Pay to: <span class="mono">${item.address}</span></p><p class="small ${item.payoutTxHash?"success":"muted"}">${note}</p><div class="actions">${action}</div></article>`;
+  }).join("");
+}
+async function ensureBsc(){
+  const chainId=await trustProvider.request({method:"eth_chainId"});
+  if(String(chainId).toLowerCase()!=="0x38")await trustProvider.request({method:"wallet_switchEthereumChain",params:[{chainId:"0x38"}]});
+  const accounts=await trustProvider.request({method:"eth_accounts"});connectedAccount=accounts?.[0]||"";
+  if(!connectedAccount||connectedAccount.toLowerCase()!==String(config.senderAddress||"").toLowerCase())throw new Error("Connect the Trust Wallet account configured as BSC_SEND_ADDRESS before sending.");
+}
+async function sendPayout(id){
+  const item=queueItems.find(row=>row.id===id);if(!item||!trustProvider)return;
+  try{
+    await ensureBsc();
+    if(item.network!=="BEP20")throw new Error("Automated payouts are currently enabled only for BEP20.");
+    const txHash=await trustProvider.request({method:"eth_sendTransaction",params:[{from:connectedAccount,to:config.tokenContract,data:transferData(item.address,item.netAmount),value:"0x0"}]});
+    setStatus("Transfer sent from Trust Wallet. Recording it and waiting for confirmations…");
+    await checkPayout(id,txHash);
+  }catch(error){setStatus(error.message||"The payout was not sent.","error")}
+}
+async function checkPayout(id,txHash){
+  try{
+    const result=await api(`/payouts/${encodeURIComponent(id)}/broadcasted`,{method:"POST",body:JSON.stringify({txHash})});
+    if(result.status==="PENDING"){setStatus(result.message,"muted");setTimeout(()=>checkPayout(id,txHash),12000);return}
+    setStatus(result.message||"Withdrawal completed.","success");await loadQueue();
+  }catch(error){setStatus(error.message||"Could not verify the payout.","error");await loadQueue()}
+}
+window.connectTrustWallet=connectTrustWallet;window.sendPayout=sendPayout;window.checkPayout=checkPayout;
+void loadQueue();
+</script>
+</body>
+</html>
